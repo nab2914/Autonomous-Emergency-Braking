@@ -2,131 +2,187 @@
 
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import Float32, Float32MultiArray  # Adjust message types if needed
+from sensor_fusion.msg import FusedObjectArray  # Updated input from sensor fusion
+from vehiclecontrol.msg import Control  # Updated output message
 
 class AEBControllerNode(Node):
     def __init__(self):
         super().__init__('aeb_controller')
 
-        # Constants and PID parameters
-        self.max_throttle = 100.0
-        self.max_brake = 100.0
-        self.emergency_brake_ttc = 1.0
-        self.min_safety_ttc = 1.2
-        self.max_safety_ttc = 3.5
-        self.vehicle_width = 1.5
-        self.kp = 200.0
-        self.ki = 50.0
-        self.kd = 20.0
-        self.dt = 0.1
+        # Publisher for vehicle control commands
+        self.control_pub = self.create_publisher(Control, '/vehicle/control', 10)
 
-        # PID state
-        self.prev_error = 0.0
-        self.integral = 0.0
-
-        # Subscribers and Publishers
-        self.create_subscription(
-            Float32,  # Input message type
-            'fused_data',       # Input topic
-            self.callback_fused_data,
-            10
+        # Subscriber for fused sensor data
+        self.fused_data_sub = self.create_subscription(
+            FusedObjectArray, '/fused_objects', self.fused_data_callback, 10
         )
 
-        self.throttle_publisher = self.create_publisher(Float32, 'throttle', 10)
-        self.brake_publisher = self.create_publisher(Float32, 'brake', 10)
+        # Constants and parameters
+        self.max_throttle = 100.0  # Max throttle percentage
+        self.max_brake = 100.0     # Max brake percentage
+        self.target_speed = 30.0   # Target speed in km/h
+        self.target_stop_distance = 6.0
+        self.stop_tolerance = 2.0  # ±2m tolerance
+        self.min_decel = 5.0       # Min deceleration rate in m/s²
+        self.max_decel = 8.0       # Max deceleration rate in m/s²
+        self.emergency_ttc = 1.0   # Threshold TTC for emergency braking (seconds)
+        self.warning_ttc = 3.0     # Threshold TTC for warning braking (seconds)
+        self.vehicle_width = 1.5   # Width of the BAJA Car in meters
 
-    def callback_fused_data(self, msg):
+        # State variables
+        self.current_distance = float('inf')
+        self.relative_velocity = 0.0
+        self.current_ttc = float('inf')
+        self.traveled_distance = 0.0
+        self.target_class_id = None
+        self.target_position = None
+        self.target_width = 1.8   # Default width of the target object (can be adjusted)
+
+    def fused_data_callback(self, msg):
         """
-        Callback to process fused data and compute control actions.
+        Callback for processing fused sensor data.
+        Data format: FusedObjectArray containing:
+            - int32 class_id
+            - geometry_msgs/Point position
+            - geometry_msgs/Vector3 velocity
         """
         try:
-            # Extract data from the incoming message
-            target_velocity = msg.data[0]
-            target_width = msg.data[1]
-            target_pos = [msg.data[2], msg.data[3]]
-            ego_velocity = msg.data[4]
-            distance = msg.data[5]
-            traveled_distance = msg.data[6]
+            nearest_distance = float('inf')
+            nearest_velocity = None
+            nearest_obj_class_id = None
+            nearest_obj_position = None
 
-            # Compute throttle and brake values using the AEB algorithm
-            throttle, brake = self.aeb_algorithm(
-                target_velocity, target_width, target_pos, ego_velocity, distance, traveled_distance
-            )
+            for fused_object in msg.objects:
+                obj_class_id = fused_object.class_id
+                obj_position = fused_object.position
+                obj_velocity = fused_object.velocity
 
-            # Publish computed control values
-            self.publish_control(throttle, brake)
-        except IndexError as e:
-            self.get_logger().error(f"Error processing fused_data: {e}")
+                # Calculate distance to object
+                distance = (obj_position.x**2 + obj_position.y**2 + obj_position.z**2)**0.5
 
-    def aeb_algorithm(self, target_velocity, target_width, target_pos, ego_velocity, distance, traveled_distance):
+                # Update nearest object information
+                if distance < nearest_distance:
+                    nearest_distance = distance
+                    nearest_velocity = obj_velocity
+                    nearest_obj_class_id = obj_class_id
+                    nearest_obj_position = obj_position
+
+            # Update state variables
+            self.current_distance = nearest_distance
+            self.relative_velocity = nearest_velocity.x  # Assuming relative velocity is along x-axis
+            self.current_ttc = self.calculate_ttc(nearest_distance, nearest_velocity.x)
+            self.target_class_id = nearest_obj_class_id
+            self.target_position = nearest_obj_position
+
+            # Process the data for control
+            self.control_aeb()
+        except Exception as e:
+            self.get_logger().error(f"Error in fused_data_callback: {e}")
+            return  # Ensure we stop further execution in case of error
+
+        self.get_logger().info(
+            f"Processed Data - Class ID: {self.target_class_id}, "
+            f"Position: ({self.target_position.x:.2f}, {self.target_position.y:.2f}, {self.target_position.z:.2f}), "
+            f"Velocity: {self.relative_velocity:.2f} m/s, "
+            f"Distance: {self.current_distance:.2f} m, "
+            f"TTC: {self.current_ttc:.2f} s"
+        )
+
+    def calculate_overlap(self, ego_position, target_position):
         """
-        Implements the AEB algorithm to calculate throttle and brake control.
+        Calculate lateral overlap between ego vehicle and target object.
         """
-        y_target = target_pos[1]
-        lateral_distance = abs(y_target)
+        lateral_distance = abs(ego_position.y - target_position.y)
+
+        # Overlap calculation (percentage overlap)
+        overlap = max(0, (self.vehicle_width + self.target_width - lateral_distance) / (self.vehicle_width + self.target_width))
+        return min(overlap, 1.0)  # Constrain overlap to [0, 1]
+
+    def calculate_ttc(self, distance, relative_velocity):
+        """
+        Calculate Time-to-Collision (TTC).
+        """
+        if relative_velocity != 0 and distance > 0:  # Handle both positive and negative velocities
+            return distance / abs(relative_velocity)  # Use absolute value of relative velocity
+        return float('inf')  # Return infinity if velocity is zero or distance is non-positive
+
+    def control_aeb(self):
+        """
+        Main AEB logic: Determines throttle/brake commands based on zones and scenarios.
+        """
+        # Initialize control message
+        control_msg = Control()
+        control_msg.steering = 0.0  # Default steering angle
+        control_msg.latswitch = 0   # Default lateral switch state
+        control_msg.longswitch = 1  # Enable longitudinal control switch
+
+        # Zone 1: Acceleration Zone
+        if self.current_ttc == float('inf'):  # No obstacle detected (TTC is infinite)
+            if self.relative_velocity < self.target_speed:
+                control_msg.throttle = self.max_throttle
+                control_msg.brake = 0.0
+                self.publish_control(control_msg)
+                self.get_logger().info(f"Zone 1: Accelerating. Throttle: {control_msg.throttle:.2f}%")
+            return
 
         # Calculate overlap factor
-        overlap = max(0, (self.vehicle_width + target_width - lateral_distance) / (self.vehicle_width + target_width))
-        overlap = min(overlap, 1)
+        ego_position = self.target_position  # Ego is represented by its position
+        overlap = self.calculate_overlap(ego_position, self.target_position)
+        self.get_logger().info(f"Overlap: {overlap:.2f}, Target Class ID: {self.target_class_id}")
 
-        # Case 1: Accelerate if safe and vehicle hasn't traveled far
-        if traveled_distance < 100 and ego_velocity < target_velocity:
-            return self.max_throttle, 0.0
+        # Zone 2: Braking Zone
+        if self.current_ttc < self.warning_ttc:
+            if self.current_ttc < self.emergency_ttc:
+                # Emergency braking
+                control_msg.throttle = 0.0
+                control_msg.brake = self.max_brake
+                self.publish_control(control_msg)
+                self.get_logger().info(f"Zone 2: Emergency Brake! Brake: {control_msg.brake:.2f}%, TTC: {self.current_ttc:.2f}")
+            else:
+                # Gradual braking with overlap consideration
+                control_msg.throttle = 0.0
+                control_msg.brake = self.calculate_brake_force(self.current_ttc, overlap, self.target_class_id)
+                self.publish_control(control_msg)
+                self.get_logger().info(f"Zone 2: Gradual Brake. Brake: {control_msg.brake:.2f}%, TTC: {self.current_ttc:.2f}")
+            return
 
-        # Calculate Time to Collision (TTC)
-        rel_vel = ego_velocity - target_velocity
-        ttc = distance / rel_vel if rel_vel > 0 and distance > 0 else float('inf')
+        # Zone 3: Stopping Zone
+        if (self.target_stop_distance - self.stop_tolerance <= self.current_distance <= self.target_stop_distance + self.stop_tolerance):
+            control_msg.throttle = 0.0
+            control_msg.brake = self.max_brake
+            self.publish_control(control_msg)
+            self.get_logger().info("Zone 3: Stopping achieved within target zone.")
+            return
 
-        # Dynamic safety TTC based on overlap
-        dynamic_safety_ttc = self.min_safety_ttc + (1 - overlap) * (self.max_safety_ttc - self.min_safety_ttc)
-
-        # Case 2: Emergency brake
-        if ttc < self.emergency_brake_ttc:
-            return 0.0, self.max_brake
-
-        # Case 3: Gradual braking with PID control
-        if ttc < dynamic_safety_ttc:
-            error = dynamic_safety_ttc - ttc
-            proportional = self.kp * error
-            self.integral += self.ki * error * self.dt
-            derivative = self.kd * (error - self.prev_error) / self.dt
-            pid_output = proportional + self.integral + derivative
-            self.prev_error = error
-            brake = min(self.max_brake, max(0.0, pid_output))
-            return 0.0, brake
-
-        # Case 4: Maintain or accelerate if safe
-        return self.max_throttle, 0.0
-
-    def publish_control(self, throttle, brake):
+    def calculate_brake_force(self, ttc, overlap, class_id):
         """
-        Publishes throttle and brake control commands.
+        Calculate appropriate brake force based on TTC, overlap factor, and object class ID.
         """
-        # Prepare throttle and brake messages
-        throttle_msg = Float32()
-        throttle_msg.data = float(throttle)
-        brake_msg = Float32()
-        brake_msg.data = float(brake)
+        brake_factor = 1.0 - overlap  # Reduce brake force based on overlap
 
-        # Publish messages
-        self.throttle_publisher.publish(throttle_msg)
-        self.brake_publisher.publish(brake_msg)
+        # Adjust brake factor based on object class ID
+        if class_id == 2:  # Car
+            brake_factor *= 1.0  # Full brake force for cars
+        elif class_id == 0:  # Pedestrian
+            brake_factor *= 0.8  # Reduced brake force for pedestrians
+        elif class_id == 1:  # Bicycle
+            brake_factor *= 0.6  # Reduced brake force for bicycles
+
+        # Linear scaling of brake force based on TTC
+        return self.max_brake * brake_factor * (1.0 - (ttc / self.warning_ttc))
+
+    def publish_control(self, control_msg):
+        """
+        Publishes control commands to the vehicle control topic.
+        """
+        self.control_pub.publish(control_msg)
 
 def main(args=None):
-    """
-    Main entry point for the AEB Controller Node.
-    """
     rclpy.init(args=args)
-    aeb_node = AEBControllerNode()
-
-    try:
-        rclpy.spin(aeb_node)
-    except KeyboardInterrupt:
-        pass
-    finally:
-        # Cleanup
-        aeb_node.destroy_node()
-        rclpy.shutdown()
+    node = AEBControllerNode()
+    rclpy.spin(node)
+    node.destroy_node()
+    rclpy.shutdown()
 
 if __name__ == '__main__':
     main()
