@@ -1,6 +1,6 @@
 from setuptools import find_packages, setup
 
-package_name = 'aeb_controller'
+package_name = 'aeb_controller1'
 
 setup(
     name=package_name,
@@ -20,9 +20,9 @@ setup(
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-	   'aeb_node = aeb_controller.aeb_node:main',
-	   'fused_data_publisher = aeb_controller.fused_data_publisher:main',
-	   'fused_data_subscriber = aeb_controller.fused_data_subscriber:main',
+	    'aeb_controller1 = aeb_controller1.aeb_controller1:main',
+            'publish = aeb_controller1.publish:main',
+            'aeb_node = aeb_controller1.aeb_node:main',
         ],
     },
 )
