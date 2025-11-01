@@ -1,0 +1,10 @@
+# Autonomous Emergency Braking System 
+An intelligent braking control system using sensor fusion and embedded control logic to detect obstacles and apply brakes automatically.
+
+## License
+This project is open-sourced under the MIT License.  
+You are free to use, modify, and distribute this code with attribution.
+
+## Contributing
+Contributions, issues, and feature requests are welcome!  
+Feel free to fork this repo and submit a pull request.
